@@ -1,0 +1,41 @@
+name: CI
+
+# Run on every push to main and on PRs targeting main. This is purely a
+# verification pipeline  it builds the images and runs the full test suite.
+# Nothing is deployed anywhere.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build images & run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the production backend image (Dockerfile sanity check)
+        run: docker build -f backend/Dockerfile -t openrag-backend:ci backend
+
+      - name: Run full test suite (unit + integration + e2e via the test profile)
+        run: |
+          docker compose --profile test up tests \
+            --build \
+            --abort-on-container-exit \
+            --exit-code-from tests
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose --profile test logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile test down -v

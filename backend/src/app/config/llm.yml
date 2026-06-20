@@ -1,0 +1,44 @@
+# LLM + embedding configuration (LiteLLM).
+#
+# This is the ONLY place model/provider settings live — everything else stays in
+# .env. Edit the model strings/endpoints here directly; keep SECRETS in .env and
+# reference them as ${VAR} (so keys never sit in source control). The
+# ${VAR:-default} form supplies a fallback.
+#
+# `model` is a LiteLLM model string, so any provider works by changing it:
+#   OpenAI   :  openai/gpt-4o
+#   Azure    :  azure/<your-deployment-name>        (set api_base + api_version)
+#   Anthropic:  anthropic/claude-opus-4-8
+#   Gemini   :  gemini/gemini-1.5-pro
+#   Groq     :  groq/llama-3.3-70b-versatile
+#   Ollama   :  ollama/llama3.1                      (set api_base)
+
+llm:
+  model: ${LLM_MODEL:-openai/gpt-4o}
+  api_base: ${LLM_API_BASE:-}            # e.g. https://my-resource.openai.azure.com
+  api_key: ${LLM_API_KEY:-}
+  api_version: ${LLM_API_VERSION:-}      # Azure only, e.g. 2024-08-01-preview
+  deployment_name: ${LLM_DEPLOYMENT:-}   # Azure deployment (informational; encode in `model` as azure/<dep>)
+  temperature: 0
+  max_tokens: 1024
+
+embedding:
+  model: ${EMBEDDING_MODEL:-openai/text-embedding-3-large}
+  api_base: ${EMBEDDING_API_BASE:-}
+  api_key: ${EMBEDDING_API_KEY:-}
+  api_version: ${EMBEDDING_API_VERSION:-}
+  deployment_name: ${EMBEDDING_DEPLOYMENT:-}
+  dimensions: ${EMBEDDING_DIM:-3072}     # MUST equal the model's real output dim
+
+#  Example: Azure OpenAI 
+# llm:
+#   model: azure/gpt-4o-deployment
+#   api_base: https://my-resource.openai.azure.com
+#   api_key: ${AZURE_OPENAI_API_KEY}
+#   api_version: 2024-08-01-preview
+# embedding:
+#   model: azure/text-embedding-3-large-deployment
+#   api_base: https://my-resource.openai.azure.com
+#   api_key: ${AZURE_OPENAI_API_KEY}
+#   api_version: 2024-08-01-preview
+#   dimensions: 3072
