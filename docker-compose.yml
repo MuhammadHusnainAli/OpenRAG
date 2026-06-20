@@ -1,0 +1,237 @@
+name: openrag
+
+# All configuration comes from the root `.env` (copy `.env.example` → `.env`).
+# Nothing below hard codes credentials or database names  the infra vars are
+# REQUIRED and the stack refuses to start if they are missing, so dev and prod
+# always run with values you set explicitly.
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-development}
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:?set RABBITMQ_USER in .env}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@rabbitmq:5672//
+  QDRANT_URL: http://qdrant:6333
+  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}     # set true in production (HTTPS)
+  # LLM/embedding model config lives in src/app/config/llm.yml; it reads these:
+  LLM_MODEL: ${LLM_MODEL:-openai/gpt-4o}
+  LLM_API_BASE: ${LLM_API_BASE:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_API_VERSION: ${LLM_API_VERSION:-}
+  LLM_DEPLOYMENT: ${LLM_DEPLOYMENT:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-openai/text-embedding-3-large}
+  EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+  EMBEDDING_API_VERSION: ${EMBEDDING_API_VERSION:-}
+  EMBEDDING_DEPLOYMENT: ${EMBEDDING_DEPLOYMENT:-}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-3072}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+  MAX_FILES_PER_SESSION: ${MAX_FILES_PER_SESSION:-50}
+  MAX_SESSION_TOTAL_MB: ${MAX_SESSION_TOTAL_MB:-1024}
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+  MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+  MICROSOFT_TENANT: ${MICROSOFT_TENANT:-common}
+  GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+  GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+  OAUTH_REDIRECT_BASE: ${OAUTH_REDIRECT_BASE:-http://localhost:8000/api/auth}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-no-reply@openrag.local}
+  REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-true}
+  DISPOSABLE_BLOCK: ${DISPOSABLE_BLOCK:-true}
+  EMAIL_ALLOWLIST: ${EMAIL_ALLOWLIST:-}
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "10005:5432"        # host:container — Postgres reachable on localhost:10005
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [data]
+
+  # One-shot schema bootstrap. Waits for Postgres, then checks whether the
+  # schema already exists: if it does, it does nothing; if not, it applies the
+  # fresh schema from backend/db/db.sql. db.sql is fully idempotent
+  # (CREATE … IF NOT EXISTS), so re-runs are always safe. backend/worker wait
+  # for this to finish successfully before starting.
+  db-init:
+    image: postgres:18-alpine
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - ./backend/db/db.sql:/schema/db.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        present=$$(psql -tAc "SELECT to_regclass('public.users') IS NOT NULL")
+        if [ "$$present" = "t" ]; then
+          echo "[db-init] schema already present — nothing to do";
+        else
+          echo "[db-init] schema not found — applying backend/db/db.sql";
+          psql -v ON_ERROR_STOP=1 -f /schema/db.sql;
+          echo "[db-init] schema created";
+        fi
+    restart: "no"
+    networks: [data]
+
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    ports:
+      - "10006:5672"    # host:container — AMQP reachable on localhost:10006
+      - "15672:15672"   # management UI (http://localhost:15672)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [data]
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - qdrantdata:/qdrant/storage
+    ports:
+      - "6333:6333"
+    # The qdrant image ships no shell/curl, so we rely on the app's own
+    # ensure_collection() retry at startup rather than a container healthcheck.
+    networks: [data]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment: *backend-env
+    volumes:
+      - uploads:/data/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:   { condition: service_healthy }
+      db-init:    { condition: service_completed_successfully }
+      rabbitmq:   { condition: service_healthy }
+      qdrant:     { condition: service_started }
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    networks: [data, edge]
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment: *backend-env
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      postgres:   { condition: service_healthy }
+      db-init:    { condition: service_completed_successfully }
+      rabbitmq:   { condition: service_healthy }
+      qdrant:     { condition: service_started }
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+    networks: [data]
+
+  # ── Test stack (profile: test) ──────────────────────────────────────────────
+  # Single-file build + test: this profile brings its own ephemeral, test-credentialed
+  # Postgres / RabbitMQ / Qdrant so the suite never touches dev/prod data and needs no
+  # real .env. The `tests` image (Dockerfile.test) waits for the services, then runs the
+  # full suite — unit + integration/ + e2e/ (RUN_INTEGRATION=1 gates the latter two).
+  #
+  # Run ONLY the test stack (the prod services stay down because we name `tests`):
+  #   docker compose --profile test up tests --build \
+  #       --abort-on-container-exit --exit-code-from tests
+  test-postgres:
+    profiles: [test]
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: openrag
+      POSTGRES_PASSWORD: openrag
+      POSTGRES_DB: openrag_test
+    volumes:
+      # fresh container each run, so initdb applies the schema on first boot
+      - ./backend/db/db.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openrag -d openrag_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    networks: [test]
+
+  test-rabbitmq:
+    profiles: [test]
+    image: rabbitmq:4.3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: openrag
+      RABBITMQ_DEFAULT_PASS: openrag
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [test]
+
+  test-qdrant:
+    profiles: [test]
+    image: qdrant/qdrant:v1.18.2
+    networks: [test]
+
+  tests:
+    profiles: [test]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.test
+    environment:
+      APP_ENV: development
+      SECRET_KEY: test-secret-key-not-for-production-0123456789abcdef
+      DATABASE_URL: postgresql+asyncpg://openrag:openrag@test-postgres:5432/openrag_test
+      RABBITMQ_URL: amqp://openrag:openrag@test-rabbitmq:5672//
+      QDRANT_URL: http://test-qdrant:6333
+      QDRANT_COLLECTION: documents
+      COOKIE_SECURE: "false"
+      REQUIRE_EMAIL_VERIFICATION: "false"
+      EMBEDDING_DIM: "3072"
+      RUN_INTEGRATION: "1"
+    depends_on:
+      test-postgres: { condition: service_healthy }
+      test-rabbitmq: { condition: service_healthy }
+      test-qdrant:   { condition: service_started }
+    networks: [test]
+
+volumes:
+  pgdata:
+  rabbitmqdata:
+  qdrantdata:
+  uploads:
+
+networks:
+  data:        # app <-> data stores (internal)
+  edge:        # reverse-proxy <-> app (front this with nginx in production)
+  test:        # isolated network for the `test` profile (ephemeral services)
